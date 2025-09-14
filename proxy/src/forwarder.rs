@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
@@ -8,6 +8,9 @@ use std::{
     thread::{Builder, JoinHandle},
     time::{Duration, SystemTime},
 };
+
+#[cfg(not(target_os = "macos"))]
+use std::net::Ipv6Addr;
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, RecvError};
@@ -160,6 +163,14 @@ pub fn start_forwarder_threads(
             let send_thread = Builder::new()
                 .name(format!("ssPxyTx_{thread_id}"))
                 .spawn(move || {
+                    // Use IPv4 socket on macOS to avoid "Invalid argument" errors when sending to IPv4 addresses
+                    #[cfg(target_os = "macos")]
+                    let send_socket =
+                        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+                            .expect("to bind to udp port for forwarding");
+
+                    // Use IPv6 socket on other platforms (supports dual-stack)
+                    #[cfg(not(target_os = "macos"))]
                     let send_socket =
                         UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
                             .expect("to bind to udp port for forwarding");

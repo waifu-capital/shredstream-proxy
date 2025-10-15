@@ -2,20 +2,407 @@ use std::{collections::HashSet, hash::Hash, sync::atomic::Ordering};
 
 use itertools::Itertools;
 use jito_protos::shredstream::TraceShred;
-use log::{debug, warn};
+use log::{debug, warn, info, error};
 use prost::Message;
 use solana_ledger::{
     blockstore::MAX_DATA_SHREDS_PER_SLOT,
     shred::{
+        layout,
+        traits::Shred as ShredTrait,
         merkle::{Shred, ShredCode},
         ReedSolomonCache, ShredType, Shredder,
     },
 };
+use bincode::ErrorKind;
+use std::str::FromStr;
 use solana_metrics::datapoint_warn;
 use solana_perf::packet::PacketBatch;
-use solana_sdk::clock::{Slot, MAX_PROCESSING_AGE};
+use solana_sdk::{clock::{
+    Slot, MAX_PROCESSING_AGE}, 
+    message::VersionedMessage, 
+    pubkey,
+    pubkey::{Pubkey}, 
+    signature::Signature, 
+    transaction::VersionedTransaction,
+    message::legacy::Message as LegacyMessage,
+    message::v0::Message as V0Message,
+    hash::Hash as SdkHash,
+};
+use std::io::Cursor;
+use bincode::Options;
+use solana_entry::entry::Entry;
 
 use crate::forwarder::ShredMetrics;
+
+/// Programs to filter
+pub static PUMP_FUN_PROGRAM_ID: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+pub static VOTE_PROGRAM_ID: Pubkey = pubkey!("Vote111111111111111111111111111111111111111");
+
+/// In-memory per-slot streaming state.
+#[derive(Debug, Default)]
+struct SlotStream {
+    /// Map from segment start index to streaming state for that segment
+    segments: ahash::HashMap<usize, SegmentStream>,
+}
+
+#[derive(Debug)]
+struct SegmentStream {
+    /// Streaming buffer that starts at a known segment boundary.
+    buf: Vec<u8>,
+    /// FEC set index of the segment
+    fec_set_index: u32,
+    /// Current read offset inside `buf` (how many bytes we have already *consumed*).
+    cursor: usize,
+    /// If we are inside a segment, this is the decoded `Vec<Entry>` length (item count).
+    vec_len: Option<usize>,
+    /// How many `Entry` items we've already emitted for the *current* segment.
+    entries_emitted: usize,
+    /// How many `VersionedTransaction` items we've already emitted for the *current* segment.
+    txs_emitted: usize,
+    /// Next shred index we still need to append into `buf`.
+    next_index_to_buffer: usize,
+
+    // Keep track of the next entry and tx to emit so we can skip over them if we have already emitted them
+    next_entry_to_emit: usize,
+    next_tx_to_emit: usize,
+}
+
+impl SegmentStream {
+    /// Compact the streaming buffer if we’ve consumed a large prefix already.
+    fn maybe_compact(&mut self) {
+        // If we’ve consumed >1MB, drop the consumed prefix to avoid unbounded growth.
+            if self.cursor > (1 << 20) {
+                self.buf.drain(0..self.cursor);
+                self.cursor = 0;
+            }
+    }
+
+    /// Reset segment-local counters at a segment boundary.
+    fn reset_segment(&mut self) {
+        self.vec_len = None;
+        self.entries_emitted = 0;
+        // Note: we do *not* reset the buffer. The next segment begins *at* `cursor`, which may be
+        // mid-shred if boundaries don’t align to shreds. New bytes will be appended as they arrive.
+    }
+}
+
+impl SlotStream {
+    fn new() -> Self {
+        Self {
+            segments: ahash::HashMap::default(),
+        }
+    }
+}
+
+/// Public handle kept in the reconstructor thread. One instance per process.
+pub struct StreamingDecoder {
+    /// Per-slot streaming state.
+    per_slot: ahash::HashMap<Slot, SlotStream>,
+}
+
+impl StreamingDecoder {
+    pub fn new() -> Self {
+        Self {
+            per_slot: ahash::HashMap::default(),
+        }
+    }
+
+    pub fn advance_for_fec_set(&mut self, slot: Slot, tracker: &ShredsStateTracker, fec_set_index: u32) {
+        // Find the segment start for this FEC set index (similar to get_indexes but only finding start)
+        // let Some(segment_start) = find_segment_start_for_fec_set(tracker, fec_set_index as usize) else {
+        //     return;
+        // };
+
+        // There is a chance that the segment start is not the same as the fec_set_index, but there is no real way to check that because at this point, 
+        // we dont have all the shreds. So if we take the `fec_set_index` and roll backwards to find the first shred that is `DataComplete`,
+        // we risk skipping very far back because our data shreds are sparse.
+        let segment_start = fec_set_index as usize;
+        
+        let slot_stream = self.per_slot.entry(slot).or_insert_with(SlotStream::default);
+        
+        // Get or create stream for this segment
+        let mut segment = slot_stream.segments.entry(segment_start).or_insert_with(|| SegmentStream {
+            buf: Vec::with_capacity(8 * 1024),
+            fec_set_index: fec_set_index,
+            cursor: 0,
+            vec_len: None,
+            entries_emitted: 0,
+            txs_emitted: 0,
+            next_index_to_buffer: segment_start,
+            next_entry_to_emit: 0,
+            next_tx_to_emit: 0,
+        });
+
+        // Append contiguous shreds from where we left off
+        let mut idx = segment.next_index_to_buffer;
+        while idx < tracker.data_shreds.len() {
+            match &tracker.data_shreds[idx] {
+                Some(Shred::ShredData(s)) => {
+                    // if segment_start == idx {
+                    //     info!("we got the starting shred for fec_set_index {fec_set_index}!");
+                    // }
+                    // info!("slot {slot}, fec_set_index {fec_set_index}, idx {idx}: got ShredData: fec_set_index {}, index {}", s.common_header.fec_set_index, s.common_header.index);
+                    match layout::get_data(s.payload()) {
+                        Ok(bytes) => segment.buf.extend_from_slice(bytes),
+                        Err(e) => {
+                            debug!("slot {slot} idx {idx}: failed to get_data: {e:?}");
+                        }
+                    }
+                    idx += 1;
+                }
+                Some(Shred::ShredCode(_)) => {
+                    idx += 1;
+                }
+                None => break, // Gap - stop for now
+            }
+        }
+        segment.next_index_to_buffer = idx;
+        
+        // Try to decode with what we have
+        Self::stream_decode_and_log(slot, &mut segment);
+    }
+
+
+    fn gc_old_slots(&mut self, highest_slot_seen: Slot) {
+        let threshold = highest_slot_seen.saturating_sub(SLOT_LOOKBACK);
+        self.per_slot.retain(|slot, _| *slot >= threshold);
+    }
+
+    /// Streaming bincode decoding:
+    /// - If `vec_len` is `None`, read the Vec<Entry> length prefix (u64).
+    /// - Otherwise, decode one `Entry` at a time until we hit EOF (need more bytes) or
+    ///   finish the current segment (emitted `vec_len` entries) in which case we reset
+    ///   and immediately start the next segment at the current cursor.
+    fn stream_decode_and_log(slot: Slot, stream: &mut SegmentStream) {
+        //////////////////////////////////////////////
+        // PARSING THE VECTOR LENGTH OF THE ENTRIES //
+        //////////////////////////////////////////////
+         
+        // Get handle to the stream cursor
+        let mut cur = Cursor::new(&stream.buf[stream.cursor..]);
+
+        // If we haven't read the vector length yet, try to read it.
+        if stream.vec_len.is_none() {
+            match bincode::deserialize_from::<_, u64>(&mut cur) {
+                Ok(n) => {
+                    // Now we know the length of the vector that contains the entries.
+                    stream.vec_len = Some(n as usize);
+
+                    // // Update the cursor in the stream
+                    // stream.cursor += cur.position() as usize; // consumed bytes (likely 8)
+                }
+                Err(e) => {
+                    // If just not enough bytes yet, stop; else log and stop.
+                    if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
+                    {
+                        // reset the cursor to 0
+                        stream.cursor = 0;
+                        return;
+                    } else {
+                        info!(
+                            "slot {slot}: failed to read Vec<Entry> length at cursor {}: {e:?}",
+                            stream.cursor
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        // We know the vector length, decode entries in order.
+        let vec_len = match stream.vec_len {
+            Some(n) => n,
+            None => {
+                // Should not happen; defensive
+                error!("slot {slot}: no vector length found. Should not have happened");
+                return;
+            },
+        };
+            
+        // If the segment declares more than 50 entries, there is some issue with the decoding and we probably 
+        // dont have the beginning of a `Vec<Entry>`
+        if vec_len > 50 {
+            return;
+        }
+
+        /////////////////////////////////
+        // PARSING EACH OF THE ENTRIES //
+        /////////////////////////////////
+
+        // Decode each `Entry` while possible.
+        // Consume entries until we have emitted `vec_len` entries (or run out of bytes)
+        while stream.entries_emitted < vec_len {
+            // num_hashes: u64
+            if let Err(e) = bincode::deserialize_from::<_, u64>(&mut cur) {
+                if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+                    return; // need more bytes
+                } else {
+                    debug!("slot {slot}: read num_hashes failed at {}: {e:?}", stream.cursor);
+                    return;
+                }
+            }
+
+            // hash: Hash (32 bytes)
+            if let Err(e) = bincode::deserialize_from::<_, SdkHash>(&mut cur) {
+                if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+                    return; // need more bytes
+                } else {
+                    debug!("slot {slot}: read hash failed at {}: {e:?}", stream.cursor);
+                    return;
+                }
+            }
+
+            // txs_len: u64 (Vec<VersionedTransaction>.len)
+            let txs_len = match bincode::deserialize_from::<_, u64>(&mut cur) {
+                Ok(n) => n as usize,
+                Err(e) => {
+                    if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+                        return;
+                    } else {
+                        debug!(
+                            "slot {slot}: read entry Vec<VersionedTransaction>.len failed at {}: {e:?}",
+                            stream.cursor
+                        );
+                        return;
+                    }
+                }
+            };
+
+            //////////////////////////////
+            // PARSING EACH OF THE TXNS //
+            //////////////////////////////
+
+            // Decode each `VersionedTransaction` while possible.
+            // Consume txs until we have emitted `txs_len` txs (or run out of bytes)
+            while stream.txs_emitted < txs_len {
+                match bincode::deserialize_from::<_, VersionedTransaction>(&mut cur) {
+                    Ok(tx) => {
+                        // // Only log txns that do not interact with vote program
+                        if touches_program(&tx, &PUMP_FUN_PROGRAM_ID) {
+                            // Get the tx signature
+                            let sig = tx.signatures.get(0).cloned();
+                            match sig {
+                                Some(s) => {
+                                    info!(
+                                        "tx: sig={} slot={} fec_set_index={} (entries_in_vec={}, entry_idx={}, txs_in_vec={}, tx_idx={})",
+                                        s,
+                                        slot,
+                                        stream.fec_set_index,
+                                        vec_len,
+                                        stream.entries_emitted, // current entry (0-based will be added after finishing)
+                                        txs_len,
+                                        stream.txs_emitted,
+                                    );
+                                }
+                                None => {
+                                    debug!("slot {slot}: no signature found for tx");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+                            return;
+                        } else {
+                            debug!(
+                                "slot {slot}: decode VersionedTransaction failed at {}: {e:?}",
+                                stream.cursor
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                // Increment the tx index
+                stream.txs_emitted += 1;
+            }
+
+            // Increment the entry index
+            stream.entries_emitted += 1;
+        }
+    }
+}
+
+/// NEW CODE
+
+/// Find segment start for a FEC set index - adapted from get_indexes but only finds the start
+fn find_segment_start_for_fec_set(tracker: &ShredsStateTracker, fec_set_index: usize) -> Option<usize> {
+    if fec_set_index >= tracker.data_status.len() {
+        return None;
+    }
+    
+    // Special case for index 0
+    if fec_set_index == 0 {
+        return Some(0);
+    }
+    
+    // Search backwards from fec_set_index to find previous DATA_COMPLETE
+    let mut current = fec_set_index;
+    let mut next = current - 1;
+    
+    loop {
+        match tracker.data_status[next] {
+            ShredStatus::DataComplete => {
+                // Segment starts after this DATA_COMPLETE
+                return Some(current);
+            }
+            ShredStatus::NotDataComplete => {
+                if next == 0 {
+                    // No earlier DATA_COMPLETE, start from 0
+                    return Some(0);
+                }
+                current = next;
+                next -= 1;
+            }
+            ShredStatus::Unknown => {
+                // Best guess - start from current position
+                return Some(current);
+            }
+        }
+    }
+}
+
+/// Determine whether the transaction "touches" (has a top-level instruction for) `program_id`.
+///
+/// Notes:
+/// - For legacy messages, program ids are resolved directly from `account_keys`.
+/// - For v0 messages, we check against **static** account keys. If the program id were supplied
+///   via an address table lookup (rare; program ids are commonly static), we won’t be able to
+///   resolve it here without LUT resolution. For Pump.fun in practice, static is sufficient.
+fn touches_program(tx: &VersionedTransaction, program_id: &Pubkey) -> bool {
+    match &tx.message {
+        VersionedMessage::Legacy(m) => {
+            touches_program_legacy(m, program_id)
+        }
+        VersionedMessage::V0(m) => {
+            touches_program_v0(m, program_id)
+        }
+        // Future message versions would be handled here similarly.
+    }
+}
+
+fn touches_program_legacy(m: &LegacyMessage, program_id: &Pubkey) -> bool {
+    for ix in m.instructions.iter() {
+        let idx = ix.program_id_index as usize;
+        if let Some(pid) = m.account_keys.get(idx) {
+            if pid == program_id {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn touches_program_v0(m: &V0Message, program_id: &Pubkey) -> bool {
+    let static_keys = &m.account_keys;
+    for ix in m.instructions.iter() {
+        let idx = ix.program_id_index as usize;
+        if idx < static_keys.len() && &static_keys[idx] == program_id {
+            return true;
+        }
+    }
+    false
+}
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 enum ShredStatus {
@@ -70,6 +457,7 @@ pub fn reconstruct_shreds(
     highest_slot_seen: &mut Slot,
     rs_cache: &ReedSolomonCache,
     metrics: &ShredMetrics,
+    streaming: &mut StreamingDecoder,
 ) -> usize {
     deshredded_entries.clear();
     slot_fec_indexes_to_iterate.clear();
@@ -120,6 +508,7 @@ pub fn reconstruct_shreds(
     // try recovering by FEC set
     // already checked if FEC set is completed or deserialized
     let mut total_recovered_count = 0;
+
     for (slot, fec_set_index) in slot_fec_indexes_to_iterate.iter() {
         let (all_shreds, state_tracker) = all_shreds.entry(*slot).or_default();
         let shreds = all_shreds.entry(*fec_set_index).or_default();
@@ -136,6 +525,13 @@ pub fn reconstruct_shreds(
             || shreds.len() < min_shreds_needed_to_recover
             || num_data_shreds == num_expected_data_shreds
         {
+            // If we cannot fully decode, then we should try to partially decode via streaming
+            streaming.advance_for_fec_set(*slot, state_tracker, *fec_set_index);
+
+            // Cleanup old slots
+            streaming.gc_old_slots(*highest_slot_seen);
+
+            // skip to the next fec set
             continue;
         }
 
@@ -581,7 +977,7 @@ mod tests {
     use solana_sdk::{clock::Slot, hash::Hash, signature::Keypair};
 
     use crate::{
-        deshred::{reconstruct_shreds, ComparableShred},
+        deshred::{reconstruct_shreds, ComparableShred, StreamingDecoder},
         forwarder::ShredMetrics,
     };
 
@@ -674,6 +1070,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut streaming = StreamingDecoder::new();
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -693,6 +1090,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut streaming,
         );
 
         // debug_to_disk(&mut deshredded_entries);
@@ -729,6 +1127,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut streaming = StreamingDecoder::new();
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -750,6 +1149,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut streaming,
         );
 
         // debug_to_disk(&deshredded_entries, "new.txt");
@@ -851,6 +1251,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut streaming = StreamingDecoder::new();
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -870,6 +1271,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut streaming,
         );
 
         // debug_to_disk(&mut deshredded_entries);
@@ -906,6 +1308,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut streaming = StreamingDecoder::new();
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -927,6 +1330,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut streaming,
         );
 
         // debug_to_disk(&deshredded_entries, "new.txt");
@@ -1007,6 +1411,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut streaming = StreamingDecoder::new();
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(packets.clone()),
             &mut all_shreds,
@@ -1015,6 +1420,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut streaming,
         );
         assert_eq!(recovered_count, 0);
         assert_eq!(
@@ -1034,6 +1440,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut streaming = StreamingDecoder::new();
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -1049,6 +1456,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut streaming,
         );
         assert!(recovered_count > 0);
         assert_eq!(

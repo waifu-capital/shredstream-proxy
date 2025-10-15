@@ -37,7 +37,7 @@ use tokio::sync::broadcast::Sender;
 
 use crate::{
     deshred,
-    deshred::{ComparableShred, ShredsStateTracker},
+    deshred::{ComparableShred, ShredsStateTracker, StreamingDecoder},
     resolve_hostname_port, ShredstreamProxyError,
 };
 
@@ -103,6 +103,9 @@ pub fn start_forwarder_threads(
                 let mut highest_slot_seen: Slot = 0;
                 let rs_cache = ReedSolomonCache::default();
 
+                // NEW: incremental (streaming) decoder runs alongside the full-segment path.
+                let mut streaming = StreamingDecoder::new();
+
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(pkt_batch) => {
@@ -114,8 +117,10 @@ pub fn start_forwarder_threads(
                                 &mut highest_slot_seen,
                                 &rs_cache,
                                 &metrics,
+                                &mut streaming,
+                                
                             );
-
+                            
                             deshredded_entries.drain(..).for_each(
                                 |(slot, _entries, entries_bytes)| {
                                     let _ = entry_sender.send(PbEntry {

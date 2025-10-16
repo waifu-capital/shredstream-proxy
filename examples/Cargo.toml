@@ -7,8 +7,13 @@ publish = false
 bincode = { workspace = true }
 jito-protos = { path = "../jito_protos" }
 solana-entry = { workspace = true }
+solana-sdk = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 
 [[example]]
 name = "deshred"
 path = "deshred.rs"
+
+[[example]]
+name = "deshred_txns"
+path = "deshred_txns.rs"

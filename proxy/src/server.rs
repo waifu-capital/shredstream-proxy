@@ -9,6 +9,7 @@ use crossbeam_channel::Receiver;
 use jito_protos::shredstream::{
     shredstream_proxy_server::{ShredstreamProxy, ShredstreamProxyServer},
     Entry as PbEntry, SubscribeEntriesRequest,
+    SubscribeVersionedTransactionsRequest, VersionedTransaction as PbVersionedTransaction,
 };
 use log::{debug, info};
 use tokio::sync::broadcast::{Receiver as BroadcastReceiver, Sender};
@@ -17,11 +18,13 @@ use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 #[derive(Debug)]
 pub struct ShredstreamProxyService {
     entry_sender: Arc<Sender<PbEntry>>,
+    versioned_transaction_sender: Arc<Sender<PbVersionedTransaction>>,
 }
 
 pub fn start_server_thread(
     addr: SocketAddr,
     entry_sender: Arc<Sender<PbEntry>>,
+    versioned_transaction_sender: Arc<Sender<PbVersionedTransaction>>,
     exit: Arc<AtomicBool>,
     shutdown_receiver: Receiver<()>,
 ) -> JoinHandle<()> {
@@ -33,6 +36,7 @@ pub fn start_server_thread(
             tonic::transport::Server::builder()
                 .add_service(ShredstreamProxyServer::new(ShredstreamProxyService {
                     entry_sender,
+                    versioned_transaction_sender,
                 }))
                 .serve(addr)
                 .await
@@ -54,6 +58,7 @@ pub fn start_server_thread(
 #[tonic::async_trait]
 impl ShredstreamProxy for ShredstreamProxyService {
     type SubscribeEntriesStream = ReceiverStream<Result<PbEntry, tonic::Status>>;
+    type SubscribeVersionedTransactionsStream = ReceiverStream<Result<PbVersionedTransaction, tonic::Status>>;
 
     async fn subscribe_entries(
         &self,
@@ -65,6 +70,28 @@ impl ShredstreamProxy for ShredstreamProxyService {
         tokio::spawn(async move {
             while let Ok(entry) = entry_receiver.recv().await {
                 match tx.send(Ok(entry)).await {
+                    Ok(_) => (),
+                    Err(_e) => {
+                        debug!("client disconnected");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn subscribe_versioned_transactions(
+        &self, 
+        _request: tonic::Request<SubscribeVersionedTransactionsRequest>
+    ) -> Result<tonic::Response<Self::SubscribeVersionedTransactionsStream>, tonic::Status> {
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let mut versioned_transaction_receiver: BroadcastReceiver<PbVersionedTransaction> = self.versioned_transaction_sender.subscribe();
+
+        tokio::spawn(async move {
+            while let Ok(versioned_transaction) = versioned_transaction_receiver.recv().await {
+                match tx.send(Ok(versioned_transaction)).await {
                     Ok(_) => (),
                     Err(_e) => {
                         debug!("client disconnected");

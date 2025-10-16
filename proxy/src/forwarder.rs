@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, RecvError};
 use dashmap::DashMap;
 use itertools::Itertools;
-use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
+use jito_protos::shredstream::{Entry as PbEntry, TraceShred, VersionedTransaction as PbVersionedTransaction};
 use log::{debug, error, info, warn};
 use prost::Message;
 use solana_client::client_error::reqwest;
@@ -57,6 +57,7 @@ pub fn start_forwarder_threads(
     deduper: Arc<RwLock<Deduper<2, [u8]>>>,
     should_reconstruct_shreds: bool,
     entry_sender: Arc<Sender<PbEntry>>,
+    versioned_transaction_sender: Arc<Sender<PbVersionedTransaction>>,
     debug_trace_shred: bool,
     use_discovery_service: bool,
     forward_stats: Arc<StreamerReceiveStats>,
@@ -104,7 +105,7 @@ pub fn start_forwarder_threads(
                 let rs_cache = ReedSolomonCache::default();
 
                 // NEW: incremental (streaming) decoder runs alongside the full-segment path.
-                let mut streaming = StreamingDecoder::new();
+                let mut streaming = StreamingDecoder::new(versioned_transaction_sender);
 
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
@@ -118,7 +119,6 @@ pub fn start_forwarder_threads(
                                 &rs_cache,
                                 &metrics,
                                 &mut streaming,
-                                
                             );
                             
                             deshredded_entries.drain(..).for_each(

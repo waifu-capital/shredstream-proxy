@@ -287,6 +287,8 @@ fn main() -> Result<(), ShredstreamProxyError> {
     )));
 
     let entry_sender = Arc::new(BroadcastSender::new(100));
+    let versioned_transaction_sender = Arc::new(BroadcastSender::new(100));
+
     let forward_stats = Arc::new(StreamerReceiveStats::new("shredstream_proxy-listen_thread"));
     let use_discovery_service =
         args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
@@ -304,6 +306,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         deduper.clone(),
         args.grpc_service_port.is_some(),
         entry_sender.clone(),
+        versioned_transaction_sender.clone(),
         args.debug_trace_shred,
         use_discovery_service,
         forward_stats.clone(),
@@ -348,6 +351,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         let server_hdl = server::start_server_thread(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
             entry_sender.clone(),
+            versioned_transaction_sender.clone(),
             exit.clone(),
             shutdown_receiver.clone(),
         );

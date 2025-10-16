@@ -1,7 +1,7 @@
 use std::{collections::HashSet, hash::Hash, sync::atomic::Ordering};
 
 use itertools::Itertools;
-use jito_protos::shredstream::TraceShred;
+use jito_protos::shredstream::{TraceShred, VersionedTransaction as PbVersionedTransaction};
 use log::{debug, warn, info, error};
 use prost::Message;
 use solana_ledger::{
@@ -30,6 +30,8 @@ use solana_sdk::{clock::{
     hash::Hash as SdkHash,
 };
 use std::io::Cursor;
+use std::sync::Arc;
+use tokio::sync::broadcast::Sender;
 use bincode::Options;
 use solana_entry::entry::Entry;
 
@@ -106,12 +108,15 @@ impl SlotStream {
 pub struct StreamingDecoder {
     /// Per-slot streaming state.
     per_slot: ahash::HashMap<Slot, SlotStream>,
+    // Sender for versioned transactions over gRPC
+    versioned_transaction_sender: Arc<Sender<PbVersionedTransaction>>,
 }
 
 impl StreamingDecoder {
-    pub fn new() -> Self {
+    pub fn new(versioned_transaction_sender: Arc<Sender<PbVersionedTransaction>>) -> Self {
         Self {
             per_slot: ahash::HashMap::default(),
+            versioned_transaction_sender,
         }
     }
 
@@ -176,8 +181,30 @@ impl StreamingDecoder {
         // Update the next index to buffer to the next index after the segment
         segment.next_index_to_buffer = segment.segment_end + 1;
 
-        // Try to decode with what we have
-        Self::stream_decode_and_log(slot, &mut segment);
+        // Try to find as many versioned transactions as possible from the segment
+        let txns =Self::stream_decode_and_log(
+            slot, 
+            &mut segment, 
+        );
+
+        // Send the versioned transactions to the gRPC stream if we have any.
+        if !txns.is_empty() {
+            // Serialize the versioned transactions to a buffer
+            let txns_buffer = match bincode::serialize(&txns) {
+                Ok(buffer) => buffer,
+                Err(e) => {
+                    error!("slot {slot}: failed to serialize versioned transactions: {e:?}");
+                    return;
+                }
+            };
+
+            // Send to broadcast channel. Allow it to silently fail if there are no receivers yet.
+            let _ = self.versioned_transaction_sender.send(
+                PbVersionedTransaction {
+                    transactions: txns_buffer,
+                }
+            );
+        }
     }
 
 
@@ -191,10 +218,13 @@ impl StreamingDecoder {
     /// - Otherwise, decode one `Entry` at a time until we hit EOF (need more bytes) or
     ///   finish the current segment (emitted `vec_len` entries) in which case we reset
     ///   and immediately start the next segment at the current cursor.
-    fn stream_decode_and_log(slot: Slot, stream: &mut SegmentStream) {
+    fn stream_decode_and_log(slot: Slot, stream: &mut SegmentStream) -> Vec<VersionedTransaction> {
         //////////////////////////////////////////////
         // PARSING THE VECTOR LENGTH OF THE ENTRIES //
         //////////////////////////////////////////////
+        
+        // The vector of versioned transactions to return
+        let mut txns: Vec<VersionedTransaction> = Vec::new();
          
         // Get handle to the stream cursor
         let mut cur = Cursor::new(&stream.buf[stream.cursor..]);
@@ -211,13 +241,13 @@ impl StreamingDecoder {
                 {
                     // reset the cursor to 0
                     stream.cursor = 0;
-                    return;
+                    return txns;
                 } else {
                     info!(
                         "slot {slot}: failed to read Vec<Entry> length at cursor {}: {e:?}",
                         stream.cursor
                     );
-                    return;
+                    return txns;
                 }
             }
         }
@@ -228,7 +258,7 @@ impl StreamingDecoder {
             None => {
                 // Should not happen; defensive
                 error!("slot {slot}: no vector length found. Should not have happened");
-                return;
+                return txns;
             },
         };
 
@@ -243,20 +273,20 @@ impl StreamingDecoder {
             // num_hashes: u64
             if let Err(e) = bincode::deserialize_from::<_, u64>(&mut cur) {
                 if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
-                    return; // need more bytes
+                    return txns; // need more bytes
                 } else {
                     debug!("slot {slot}: read num_hashes failed at {}: {e:?}", stream.cursor);
-                    return;
+                    return txns;
                 }
             }
 
             // hash: Hash (32 bytes)
             if let Err(e) = bincode::deserialize_from::<_, SdkHash>(&mut cur) {
                 if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
-                    return; // need more bytes
+                    return txns; // need more bytes
                 } else {
                     debug!("slot {slot}: read hash failed at {}: {e:?}", stream.cursor);
-                    return;
+                    return txns;
                 }
             }
 
@@ -265,13 +295,13 @@ impl StreamingDecoder {
                 Ok(n) => n as usize,
                 Err(e) => {
                     if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
-                        return;
+                        return txns;
                     } else {
                         debug!(
                             "slot {slot}: read entry Vec<VersionedTransaction>.len failed at {}: {e:?}",
                             stream.cursor
                         );
-                        return;
+                        return txns;
                     }
                 }
             };
@@ -306,6 +336,9 @@ impl StreamingDecoder {
                                         stream.txs_emitted,
                                         current_time_milliseconds,
                                     );
+
+                                    // Push the versioned transaction to the vector
+                                    txns.push(tx);
                                 }
                                 None => {
                                     debug!("slot {slot}: no signature found for tx");
@@ -316,13 +349,13 @@ impl StreamingDecoder {
                     Err(e) => {
                         if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
                             debug!("ERROR: entries_emitted={} txs_emitted={}: unexpected EOF while decoding VersionedTransaction", stream.entries_emitted, stream.txs_emitted);
-                            return;
+                            return txns;
                         } else {
                             debug!(
                                 "slot {slot}: decode VersionedTransaction failed at {}: {e:?}",
                                 stream.cursor
                             );
-                            return;
+                            return txns;
                         }
                     }
                 }
@@ -334,6 +367,8 @@ impl StreamingDecoder {
             // Increment the entry index
             emitted_entries += 1;
         }
+
+        return txns;
     }
 }
 
@@ -1026,6 +1061,7 @@ mod tests {
     };
     use solana_perf::packet::{Packet, PacketBatch};
     use solana_sdk::{clock::Slot, hash::Hash, signature::Keypair};
+    use tokio::sync::broadcast::Sender;
 
     use crate::{
         deshred::{reconstruct_shreds, ComparableShred, StreamingDecoder},
@@ -1121,7 +1157,8 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let mut streaming = StreamingDecoder::new();
+        let versioned_transaction_sender = Arc::new(Sender::new(100));
+        let mut streaming = StreamingDecoder::new(versioned_transaction_sender);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -1178,7 +1215,8 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let mut streaming = StreamingDecoder::new();
+        let versioned_transaction_sender = Arc::new(Sender::new(100));
+        let mut streaming = StreamingDecoder::new(versioned_transaction_sender);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -1302,7 +1340,8 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let mut streaming = StreamingDecoder::new();
+        let versioned_transaction_sender = Arc::new(Sender::new(100));
+        let mut streaming = StreamingDecoder::new(versioned_transaction_sender);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -1359,7 +1398,8 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let mut streaming = StreamingDecoder::new();
+        let versioned_transaction_sender = Arc::new(Sender::new(100));
+        let mut streaming = StreamingDecoder::new(versioned_transaction_sender);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -1462,7 +1502,8 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let mut streaming = StreamingDecoder::new();
+        let versioned_transaction_sender = Arc::new(Sender::new(100));
+        let mut streaming = StreamingDecoder::new(versioned_transaction_sender);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(packets.clone()),
             &mut all_shreds,
@@ -1491,7 +1532,8 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let mut streaming = StreamingDecoder::new();
+        let versioned_transaction_sender = Arc::new(Sender::new(100));
+        let mut streaming = StreamingDecoder::new(versioned_transaction_sender);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets

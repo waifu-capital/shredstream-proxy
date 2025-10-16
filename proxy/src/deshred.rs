@@ -144,26 +144,20 @@ impl StreamingDecoder {
         segment.next_index_to_buffer = segment.segment_end + 1;
 
         // Try to find as many versioned transactions as possible from the segment
-        let txns =Self::stream_decode_and_log(
+        let txns =Self::stream_decode(
             slot, 
             &mut segment, 
         );
 
         // Send the versioned transactions to the gRPC stream if we have any.
         if !txns.is_empty() {
-            // Serialize the versioned transactions to a buffer
-            let txns_buffer = match bincode::serialize(&txns) {
-                Ok(buffer) => buffer,
-                Err(e) => {
-                    error!("slot {slot}: failed to serialize versioned transactions: {e:?}");
-                    return;
-                }
-            };
-
+            // The txns buffer is already formatted as: [u64 count (8 bytes LE)][raw transaction bytes...]
+            // No need to serialize again since stream_decode already returns the properly formatted buffer
+            
             // Send to broadcast channel. Allow it to silently fail if there are no receivers yet.
             let _ = self.versioned_transaction_sender.send(
                 PbVersionedTransaction {
-                    transactions: txns_buffer,
+                    transactions: txns,
                 }
             );
         }
@@ -180,145 +174,172 @@ impl StreamingDecoder {
     /// - Otherwise, decode one `Entry` at a time until we hit EOF (need more bytes) or
     ///   finish the current segment (emitted `vec_len` entries) in which case we reset
     ///   and immediately start the next segment at the current cursor.
-    fn stream_decode_and_log(slot: Slot, stream: &mut SegmentStream) -> Vec<VersionedTransaction> {
-        //////////////////////////////////////////////
-        // PARSING THE VECTOR LENGTH OF THE ENTRIES //
-        //////////////////////////////////////////////
+    fn stream_decode(slot: Slot, stream: &mut SegmentStream) -> Vec<u8> {
 
-        // Total transactions decoded so far in the current segment
-        let mut decoded_txns_in_segment = 0;
+        // Initial number of `VersionedTransaction`s that have already been sent. This is used
+        // to calculate how many `VersionedTransaction`s were decoded in the current iteration
+        let initial_txns_decoded = stream.total_decoded_txns;
         
-        // The vector of versioned transactions to return
-        let mut txns: Vec<VersionedTransaction> = Vec::new();
-         
-        // Get handle to the stream cursor
-        let mut cur = Cursor::new(&stream.buf[stream.cursor..]);
+        // Inner function that returns early when needed. I chose this pattern to avoid situations 
+        // where i have to do clean-up logic in multiple places.
+        let txns_buffer = || -> Vec<u8> {
+            //////////////////////////////////////////////
+            // PARSING THE VECTOR LENGTH OF THE ENTRIES //
+            //////////////////////////////////////////////
+            
+            // A buffer that represents a Vec<VersionedTransaction>
+            let mut txns: Vec<u8> = Vec::new();
 
-        // If we haven't read the vector length yet, try to read it.
-        match bincode::deserialize_from::<_, u64>(&mut cur) {
-            Ok(n) => {
-                // Now we know the length of the vector that contains the entries.
-                stream.vec_len = Some(n as usize);
-            }
-            Err(e) => {
-                // If just not enough bytes yet, stop; else log and stop.
-                if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
-                {
-                    // reset the cursor to 0
-                    stream.cursor = 0;
-                    return txns;
-                } else {
-                    info!(
-                        "slot {slot}: failed to read Vec<Entry> length at cursor {}: {e:?}",
-                        stream.cursor
-                    );
-                    return txns;
+            // Total transactions decoded so far in the current segment
+            let mut decoded_txns_in_segment = 0;
+             
+            // Get handle to the stream cursor
+            let mut cur = Cursor::new(&stream.buf[stream.cursor..]);
+
+            // If we haven't read the vector length yet, try to read it.
+            match bincode::deserialize_from::<_, u64>(&mut cur) {
+                Ok(n) => {
+                    // Now we know the length of the vector that contains the entries.
+                    stream.vec_len = Some(n as usize);
                 }
-            }
-        }
-
-        // We know the vector length, decode entries in order.
-        let vec_len = match stream.vec_len {
-            Some(n) => n,
-            None => {
-                // Should not happen; defensive
-                error!("slot {slot}: no vector length found. Should not have happened");
-                return txns;
-            },
-        };
-
-        /////////////////////////////////
-        // PARSING EACH OF THE ENTRIES //
-        /////////////////////////////////
-
-        // Decode each `Entry` while possible.
-        // Consume entries until we have emitted `vec_len` entries (or run out of bytes)
-        let mut emitted_entries = 0;
-        while emitted_entries < vec_len {
-            // num_hashes: u64
-            if let Err(e) = bincode::deserialize_from::<_, u64>(&mut cur) {
-                if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
-                    return txns; // need more bytes
-                } else {
-                    debug!("slot {slot}: read num_hashes failed at {}: {e:?}", stream.cursor);
-                    return txns;
-                }
-            }
-
-            // hash: Hash (32 bytes)
-            if let Err(e) = bincode::deserialize_from::<_, SdkHash>(&mut cur) {
-                if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
-                    return txns; // need more bytes
-                } else {
-                    debug!("slot {slot}: read hash failed at {}: {e:?}", stream.cursor);
-                    return txns;
-                }
-            }
-
-            // txs_len: u64 (Vec<VersionedTransaction>.len)
-            let txs_len = match bincode::deserialize_from::<_, u64>(&mut cur) {
-                Ok(n) => n as usize,
                 Err(e) => {
-                    if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+                    // If just not enough bytes yet, stop; else log and stop.
+                    if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
+                    {
+                        // reset the cursor to 0
+                        stream.cursor = 0;
                         return txns;
                     } else {
-                        debug!(
-                            "slot {slot}: read entry Vec<VersionedTransaction>.len failed at {}: {e:?}",
+                        info!(
+                            "slot {slot}: failed to read Vec<Entry> length at cursor {}: {e:?}",
                             stream.cursor
                         );
                         return txns;
                     }
                 }
+            }
+
+            // We know the vector length, decode entries in order.
+            let vec_len = match stream.vec_len {
+                Some(n) => n,
+                None => {
+                    // Should not happen; defensive
+                    error!("slot {slot}: no vector length found. Should not have happened");
+                    return txns;
+                },
             };
 
-            //////////////////////////////
-            // PARSING EACH OF THE TXNS //
-            //////////////////////////////
+            /////////////////////////////////
+            // PARSING EACH OF THE ENTRIES //
+            /////////////////////////////////
 
-            // Decode each `VersionedTransaction` while possible.
-            // Consume txs until we have emitted `txs_len` txs (or run out of bytes)
-            let mut emitted_txs = 0;
-            while emitted_txs < txs_len {
-                match bincode::deserialize_from::<_, VersionedTransaction>(&mut cur) {
-                    Ok(tx) => {
-                        // Only log txns that do not interact with vote program
-                        if touches_program(&tx, &PUMP_FUN_PROGRAM_ID) {
-                            // Add the transaction to the vector if we have not already decoded it.
-                            if decoded_txns_in_segment >= stream.total_decoded_txns {
-                                // Push the versioned transaction to the vector
-                                txns.push(tx);
-
-                                // Increment the number of decoded transactions across all iterations of this segment
-                                stream.total_decoded_txns += 1;
-                            }
-
-                            // Increment the number of decoded transactions in this segment iteration
-                            decoded_txns_in_segment += 1;
-                        }
+            // Decode each `Entry` while possible.
+            // Consume entries until we have emitted `vec_len` entries (or run out of bytes)
+            let mut emitted_entries = 0;
+            while emitted_entries < vec_len {
+                // num_hashes: u64
+                if let Err(e) = bincode::deserialize_from::<_, u64>(&mut cur) {
+                    if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+                        return txns; // need more bytes
+                    } else {
+                        debug!("slot {slot}: read num_hashes failed at {}: {e:?}", stream.cursor);
+                        return txns;
                     }
+                }
+
+                // hash: Hash (32 bytes)
+                if let Err(e) = bincode::deserialize_from::<_, SdkHash>(&mut cur) {
+                    if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+                        return txns; // need more bytes
+                    } else {
+                        debug!("slot {slot}: read hash failed at {}: {e:?}", stream.cursor);
+                        return txns;
+                    }
+                }
+
+                // txs_len: u64 (Vec<VersionedTransaction>.len)
+                let txs_len = match bincode::deserialize_from::<_, u64>(&mut cur) {
+                    Ok(n) => n as usize,
                     Err(e) => {
                         if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
-                            debug!("ERROR: entries_emitted={} txs_emitted={}: unexpected EOF while decoding VersionedTransaction", stream.entries_emitted, stream.txs_emitted);
                             return txns;
                         } else {
                             debug!(
-                                "slot {slot}: decode VersionedTransaction failed at {}: {e:?}",
+                                "slot {slot}: read entry Vec<VersionedTransaction>.len failed at {}: {e:?}",
                                 stream.cursor
                             );
                             return txns;
                         }
                     }
+                };
+
+                //////////////////////////////
+                // PARSING EACH OF THE TXNS //
+                //////////////////////////////
+
+                // Decode each `VersionedTransaction` while possible.
+                // Consume txs until we have emitted `txs_len` txs (or run out of bytes)
+                let mut emitted_txs = 0;
+                while emitted_txs < txs_len {
+                    // Get the cursor position before deserializing the `VersionedTransaction`
+                    let start_cursor = cur.position() as usize;
+
+                    match bincode::deserialize_from::<_, VersionedTransaction>(&mut cur) {
+                        Ok(tx) => {
+                            // Get the cursor position after deserializing the `VersionedTransaction`
+                            let end_cursor = cur.position() as usize;
+
+                            // Add the transaction to the buffer if it touches the pump.fun program
+                            if touches_program(&tx, &PUMP_FUN_PROGRAM_ID) {
+                                // Add the transaction to the buffer if we have not already decoded it.
+                                if decoded_txns_in_segment >= stream.total_decoded_txns {
+                                    // Push the versioned transaction to the buffer
+                                    txns.extend_from_slice(&stream.buf[start_cursor..end_cursor]);
+
+                                    // Increment the number of decoded transactions across all iterations of this segment
+                                    stream.total_decoded_txns += 1;
+                                }
+
+                                // Increment the number of decoded transactions in this segment iteration
+                                decoded_txns_in_segment += 1;
+                            }
+                        }
+                        Err(e) => {
+                            if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+                                debug!("ERROR: entries_emitted={} txs_emitted={}: unexpected EOF while decoding VersionedTransaction", stream.entries_emitted, stream.txs_emitted);
+                                return txns;
+                            } else {
+                                debug!(
+                                    "slot {slot}: decode VersionedTransaction failed at {}: {e:?}",
+                                    stream.cursor
+                                );
+                                return txns;
+                            }
+                        }
+                    }
+
+                    // Increment the tx index
+                    emitted_txs += 1;
                 }
 
-                // Increment the tx index
-                emitted_txs += 1;
+                // Increment the entry index
+                emitted_entries += 1;
             }
 
-            // Increment the entry index
-            emitted_entries += 1;
-        }
+            txns
+        }();
 
-        return txns;
+        // Calculate the number of `VersionedTransaction`s that were decoded in the current iteration
+        let txns_decoded_in_iteration = (stream.total_decoded_txns - initial_txns_decoded) as u64;
+
+        // Create a buffer to store the `VersionedTransaction`s
+        let mut buffer: Vec<u8> = Vec::new();
+
+        // Prepend the number of `VersionedTransaction`s that were decoded in the current iteration to the buffer
+        buffer.extend_from_slice(&txns_decoded_in_iteration.to_le_bytes());
+        buffer.extend_from_slice(&txns_buffer);
+
+        buffer
     }
 }
 

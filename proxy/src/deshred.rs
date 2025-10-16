@@ -9,8 +9,9 @@ use solana_ledger::{
     shred::{
         layout,
         traits::Shred as ShredTrait,
-        merkle::{Shred, ShredCode},
         ReedSolomonCache, ShredType, Shredder,
+        merkle::{Shred, ShredCode, ShredData},
+        ShredFlags,
     },
 };
 use bincode::ErrorKind;
@@ -49,6 +50,10 @@ struct SlotStream {
 struct SegmentStream {
     /// Streaming buffer that starts at a known segment boundary.
     buf: Vec<u8>,
+    /// The index of the first shred in the segment
+    segment_start: usize,
+    /// The index of the last shred in the segment
+    segment_end: usize,
     /// FEC set index of the segment
     fec_set_index: u32,
     /// Current read offset inside `buf` (how many bytes we have already *consumed*).
@@ -61,6 +66,9 @@ struct SegmentStream {
     txs_emitted: usize,
     /// Next shred index we still need to append into `buf`.
     next_index_to_buffer: usize,
+
+    shred_idxs: Vec<usize>,
+    shreds: Vec<ShredData>,
 
     // Keep track of the next entry and tx to emit so we can skip over them if we have already emitted them
     next_entry_to_emit: usize,
@@ -108,39 +116,42 @@ impl StreamingDecoder {
     }
 
     pub fn advance_for_fec_set(&mut self, slot: Slot, tracker: &ShredsStateTracker, fec_set_index: u32) {
-        // Find the segment start for this FEC set index (similar to get_indexes but only finding start)
-        // let Some(segment_start) = find_segment_start_for_fec_set(tracker, fec_set_index as usize) else {
-        //     return;
-        // };
+        // Find the segment start for this FEC set index. If we can't find a segment start, then we cant decode for this FEC set.
+        // Instead, return and we'll wait for more shreds to arrive.
+        let Some((segment_start, segment_end)) = find_inclusive_segment_bounds_for_fec_set(tracker, fec_set_index as usize) else {
+            return;
+        };
 
-        // There is a chance that the segment start is not the same as the fec_set_index, but there is no real way to check that because at this point, 
-        // we dont have all the shreds. So if we take the `fec_set_index` and roll backwards to find the first shred that is `DataComplete`,
-        // we risk skipping very far back because our data shreds are sparse.
-        let segment_start = fec_set_index as usize;
         
         let slot_stream = self.per_slot.entry(slot).or_insert_with(SlotStream::default);
         
         // Get or create stream for this segment
         let mut segment = slot_stream.segments.entry(segment_start).or_insert_with(|| SegmentStream {
             buf: Vec::with_capacity(8 * 1024),
-            fec_set_index: fec_set_index,
+            fec_set_index,
+            segment_start,
+            segment_end,
             cursor: 0,
             vec_len: None,
             entries_emitted: 0,
             txs_emitted: 0,
             next_index_to_buffer: segment_start,
+            shred_idxs: Vec::new(),
+            shreds: Vec::new(),
             next_entry_to_emit: 0,
             next_tx_to_emit: 0,
         });
 
-        // Append contiguous shreds from where we left off
+        // On cases where this is not the first time we are using the segment, we should update its end to 
+        // the latest known shred index.
+        segment.segment_end = segment_end;
+        
+        // Append contiguous shreds from where we left off, and go until
+        // we reach the end shred (inclusive)
         let mut idx = segment.next_index_to_buffer;
-        while idx < tracker.data_shreds.len() {
+        while idx <= segment.segment_end {
             match &tracker.data_shreds[idx] {
                 Some(Shred::ShredData(s)) => {
-                    // if segment_start == idx {
-                    //     info!("we got the starting shred for fec_set_index {fec_set_index}!");
-                    // }
                     // info!("slot {slot}, fec_set_index {fec_set_index}, idx {idx}: got ShredData: fec_set_index {}, index {}", s.common_header.fec_set_index, s.common_header.index);
                     match layout::get_data(s.payload()) {
                         Ok(bytes) => segment.buf.extend_from_slice(bytes),
@@ -148,7 +159,15 @@ impl StreamingDecoder {
                             debug!("slot {slot} idx {idx}: failed to get_data: {e:?}");
                         }
                     }
+                    
+                    // store the shred for debugging purposes
+                    segment.shreds.push(s.clone());
+                    
+                    // Increment the index
                     idx += 1;
+                    
+                    // store the shred index for debugging purposes
+                    segment.shred_idxs.push(s.common_header.index as usize);
                 }
                 Some(Shred::ShredCode(_)) => {
                     idx += 1;
@@ -156,7 +175,10 @@ impl StreamingDecoder {
                 None => break, // Gap - stop for now
             }
         }
-        segment.next_index_to_buffer = idx;
+        // Update the next index to buffer to the next index after the segment
+        segment.next_index_to_buffer = segment.segment_end + 1;
+
+        // info!("found segment start={} end={} for fec set {fec_set_index}, shred_idxs={:?}", segment_start, segment_end, segment.shred_idxs);
         
         // Try to decode with what we have
         Self::stream_decode_and_log(slot, &mut segment);
@@ -174,6 +196,7 @@ impl StreamingDecoder {
     ///   finish the current segment (emitted `vec_len` entries) in which case we reset
     ///   and immediately start the next segment at the current cursor.
     fn stream_decode_and_log(slot: Slot, stream: &mut SegmentStream) {
+        // info!("#################################################################");
         //////////////////////////////////////////////
         // PARSING THE VECTOR LENGTH OF THE ENTRIES //
         //////////////////////////////////////////////
@@ -218,12 +241,28 @@ impl StreamingDecoder {
                 return;
             },
         };
-            
-        // If the segment declares more than 50 entries, there is some issue with the decoding and we probably 
-        // dont have the beginning of a `Vec<Entry>`
-        if vec_len > 50 {
-            return;
-        }
+        // info!("vec_len={}", vec_len);
+
+        // info!(
+        //     "slot={} fec_set_index={} segment_start={} segment_end={} (entries_in_vec={}) shred_idxs={:?}",
+        //     slot,
+        //     stream.fec_set_index,
+        //     stream.segment_start,
+        //     stream.segment_end,
+        //     vec_len,
+        //     stream.shred_idxs.iter().map(|i| i.to_string()).collect::<Vec<String>>().join(", "),
+        //     // stream.shreds.iter().map(|s| s.data_header.flags.bits()).collect::<Vec<u8>>().iter().map(|b| format!("{:08b}", b)).collect::<Vec<String>>().join(", "),
+        //     // stream.shreds.first().unwrap(),
+        //     // stream.buf
+
+        // );
+        
+        // // If the segment declares more than 1000 entries, there is some issue with the decoding and we probably 
+        // // dont have the beginning of a `Vec<Entry>`
+        // if vec_len > 1000 {
+        //     // info!("BAD: first 64 bytes of the buffer: {:?}", stream.buf);
+        //     return;
+        // }
 
         /////////////////////////////////
         // PARSING EACH OF THE ENTRIES //
@@ -231,13 +270,14 @@ impl StreamingDecoder {
 
         // Decode each `Entry` while possible.
         // Consume entries until we have emitted `vec_len` entries (or run out of bytes)
-        while stream.entries_emitted < vec_len {
+        let mut emitted_entries = 0;
+        while emitted_entries < vec_len {
             // num_hashes: u64
             if let Err(e) = bincode::deserialize_from::<_, u64>(&mut cur) {
                 if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
                     return; // need more bytes
                 } else {
-                    debug!("slot {slot}: read num_hashes failed at {}: {e:?}", stream.cursor);
+                    info!("slot {slot}: read num_hashes failed at {}: {e:?}", stream.cursor);
                     return;
                 }
             }
@@ -247,7 +287,7 @@ impl StreamingDecoder {
                 if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
                     return; // need more bytes
                 } else {
-                    debug!("slot {slot}: read hash failed at {}: {e:?}", stream.cursor);
+                    info!("slot {slot}: read hash failed at {}: {e:?}", stream.cursor);
                     return;
                 }
             }
@@ -259,7 +299,7 @@ impl StreamingDecoder {
                     if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
                         return;
                     } else {
-                        debug!(
+                        info!(
                             "slot {slot}: read entry Vec<VersionedTransaction>.len failed at {}: {e:?}",
                             stream.cursor
                         );
@@ -267,6 +307,7 @@ impl StreamingDecoder {
                     }
                 }
             };
+            // info!("txs_len={}", txs_len);
 
             //////////////////////////////
             // PARSING EACH OF THE TXNS //
@@ -274,17 +315,22 @@ impl StreamingDecoder {
 
             // Decode each `VersionedTransaction` while possible.
             // Consume txs until we have emitted `txs_len` txs (or run out of bytes)
-            while stream.txs_emitted < txs_len {
+            let mut emitted_txs = 0;
+            while emitted_txs < txs_len {
                 match bincode::deserialize_from::<_, VersionedTransaction>(&mut cur) {
                     Ok(tx) => {
-                        // // Only log txns that do not interact with vote program
+                        // info!("got a tx: entry_idx={}, tx_idx={}, cursor={}", emitted_entries, emitted_txs, cur.position() as usize);
+                        // // // Only log txns that do not interact with vote program
                         if touches_program(&tx, &PUMP_FUN_PROGRAM_ID) {
                             // Get the tx signature
                             let sig = tx.signatures.get(0).cloned();
                             match sig {
                                 Some(s) => {
+                                    let current_time_milliseconds = std::time::SystemTime::now().duration_since(
+                                        std::time::UNIX_EPOCH
+                                    ).unwrap().as_millis();
                                     info!(
-                                        "tx: sig={} slot={} fec_set_index={} (entries_in_vec={}, entry_idx={}, txs_in_vec={}, tx_idx={})",
+                                        "tx: sig={} slot={} fec_set_index={} (entries_in_vec={}, entry_idx={}, txs_in_vec={}, tx_idx={}) milliseconds={}",
                                         s,
                                         slot,
                                         stream.fec_set_index,
@@ -292,6 +338,7 @@ impl StreamingDecoder {
                                         stream.entries_emitted, // current entry (0-based will be added after finishing)
                                         txs_len,
                                         stream.txs_emitted,
+                                        current_time_milliseconds,
                                     );
                                 }
                                 None => {
@@ -302,8 +349,10 @@ impl StreamingDecoder {
                     }
                     Err(e) => {
                         if matches!(*e, ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+                            // info!("ERROR: entries_emitted={} txs_emitted={}: unexpected EOF while decoding VersionedTransaction", stream.entries_emitted, stream.txs_emitted);
                             return;
                         } else {
+                            // info!("ERROR: entries_emitted={} txs_emitted={} cursor={}: decode VersionedTransaction failed: {e:?}", emitted_entries, emitted_txs, cur.position() as usize);
                             debug!(
                                 "slot {slot}: decode VersionedTransaction failed at {}: {e:?}",
                                 stream.cursor
@@ -314,26 +363,72 @@ impl StreamingDecoder {
                 }
 
                 // Increment the tx index
-                stream.txs_emitted += 1;
+                emitted_txs += 1;
             }
 
             // Increment the entry index
-            stream.entries_emitted += 1;
+            emitted_entries += 1;
         }
     }
 }
 
-/// NEW CODE
+/// Find inclusive segment start and end for a FEC set index. Adapted from `get_indexes` with small tweaks to consider the 
+/// sparse-ness of our shred data.
+fn find_inclusive_segment_bounds_for_fec_set(tracker: &ShredsStateTracker, fec_set_index: usize) -> Option<(usize, usize)> {
+    // info!("-----------------------------------------------------------------------");
+    // info!("find_segment_start_for_fec_set: fec_set_index={}", fec_set_index);
 
-/// Find segment start for a FEC set index - adapted from get_indexes but only finds the start
-fn find_segment_start_for_fec_set(tracker: &ShredsStateTracker, fec_set_index: usize) -> Option<usize> {
+    // No start found for an FEC set that is beyond the number of shreds we have
     if fec_set_index >= tracker.data_status.len() {
         return None;
     }
+
+    // If the first shred in the FEC set is Unknown, we can't return a segment
+    if matches!(tracker.data_status[fec_set_index], ShredStatus::Unknown) {
+        // info!("fec set {fec_set_index} *starts* with Unknown, so we can't return a segment");
+        // info!("-----------------------------------------------------------------------");
+        return None;
+    }
     
-    // Special case for index 0
+    // find the right boundary (first DataComplete >= fec_set_index)
+    let mut end = fec_set_index;
+    while end < tracker.data_status.len() {
+        match &tracker.data_status[end] {
+            ShredStatus::Unknown => {
+                // We hit an unknown shred, so we dont want to add it to our
+                // bounds.
+                // info!("looking for end. Got Unknown at index={}. Moving backward and stopping", end);
+                if end > 0 { end -= 1; }
+                break;
+            }
+            ShredStatus::DataComplete => {
+                // We found a DataComplete shred, so we can add it to our bounds
+                // and exit the loop.
+                // info!("Found end. Got DataComplete at index={}. Stopping", end);
+                break;
+            }
+            ShredStatus::NotDataComplete => {
+                // We found a NotDataComplete shred, so we can move to the next
+                // shred and continue the loop.
+                // info!("looking for end. Got NotDataComplete at index={}.moving forward", end);
+                end += 1;
+            }
+        }
+    }
+    // info!("found end of segment at index={}", end);
+
+    // the fec set *starts* with DataComplete
+    if end == 0 {
+        // info!("fec set {fec_set_index} *starts* with DataComplete");
+        // info!("-----------------------------------------------------------------------");
+        return Some((0, 0));
+    }
+
+    // If the index is 0, we cant look further backwards, so we can return after finding the end only
     if fec_set_index == 0 {
-        return Some(0);
+        // info!("fec set {fec_set_index} is the first fec set, so we can return after finding the end only");
+        // info!("-----------------------------------------------------------------------");
+        return Some((0, end));
     }
     
     // Search backwards from fec_set_index to find previous DATA_COMPLETE
@@ -341,22 +436,33 @@ fn find_segment_start_for_fec_set(tracker: &ShredsStateTracker, fec_set_index: u
     let mut next = current - 1;
     
     loop {
+        // info!("find_segment_start_for_fec_set: checking index={} for DATA_COMPLETE", next);
         match tracker.data_status[next] {
             ShredStatus::DataComplete => {
-                // Segment starts after this DATA_COMPLETE
-                return Some(current);
+                // Segment starts after this DATA_COMPLETE shred
+                // info!("found DATA_COMPLETE at index={}", next);
+                return Some((current, end));
             }
             ShredStatus::NotDataComplete => {
                 if next == 0 {
                     // No earlier DATA_COMPLETE, start from 0
-                    return Some(0);
+                    // info!("no earlier DATA_COMPLETE, starting from 0");
+                    // info!("-----------------------------------------------------------------------");
+                    return Some((0, end));
                 }
+
+                // Continue looking backward
                 current = next;
                 next -= 1;
+
+                // info!("no DATA_COMPLETE, moving to next={}", next);
             }
             ShredStatus::Unknown => {
-                // Best guess - start from current position
-                return Some(current);
+                // We reached an unknown shred, and we can't be sure where the segment starts. 
+                // Without a starting segment, the decoding process is guaranteed to fail.
+                // info!("reached an unknown shred, and we can't be sure where the segment starts.");
+                // info!("-----------------------------------------------------------------------");
+                return None;
             }
         }
     }

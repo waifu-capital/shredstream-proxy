@@ -453,7 +453,7 @@ pub fn start_forwarder_accessory_thread(
 
                     // send metrics to influx
                     recv(metrics_tick) -> _ => {
-                        metrics.report();
+                        // metrics.report();
                         metrics.reset();
                     }
 

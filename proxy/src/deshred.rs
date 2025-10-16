@@ -10,12 +10,10 @@ use solana_ledger::{
         layout,
         traits::Shred as ShredTrait,
         ReedSolomonCache, ShredType, Shredder,
-        merkle::{Shred, ShredCode, ShredData},
-        ShredFlags,
+        merkle::{Shred, ShredCode},
     },
 };
 use bincode::ErrorKind;
-use std::str::FromStr;
 use solana_metrics::datapoint_warn;
 use solana_perf::packet::PacketBatch;
 use solana_sdk::{clock::{
@@ -23,7 +21,6 @@ use solana_sdk::{clock::{
     message::VersionedMessage, 
     pubkey,
     pubkey::{Pubkey}, 
-    signature::Signature, 
     transaction::VersionedTransaction,
     message::legacy::Message as LegacyMessage,
     message::v0::Message as V0Message,
@@ -32,14 +29,11 @@ use solana_sdk::{clock::{
 use std::io::Cursor;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
-use bincode::Options;
-use solana_entry::entry::Entry;
 
 use crate::forwarder::ShredMetrics;
 
 /// Programs to filter
 pub static PUMP_FUN_PROGRAM_ID: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-pub static VOTE_PROGRAM_ID: Pubkey = pubkey!("Vote111111111111111111111111111111111111111");
 
 /// In-memory per-slot streaming state.
 #[derive(Debug, Default)]
@@ -53,10 +47,12 @@ struct SegmentStream {
     /// Streaming buffer that starts at a known segment boundary.
     buf: Vec<u8>,
     /// The index of the first shred in the segment
+    #[allow(dead_code)]
     segment_start: usize,
     /// The index of the last shred in the segment
     segment_end: usize,
     /// FEC set index of the segment
+    #[allow(dead_code)]
     fec_set_index: u32,
     /// Current read offset inside `buf` (how many bytes we have already *consumed*).
     cursor: usize,
@@ -68,40 +64,11 @@ struct SegmentStream {
     txs_emitted: usize,
     /// Next shred index we still need to append into `buf`.
     next_index_to_buffer: usize,
-
+    /// Shred indexes for debugging purposes
     shred_idxs: Vec<usize>,
-    shreds: Vec<ShredData>,
-
-    // Keep track of the next entry and tx to emit so we can skip over them if we have already emitted them
-    next_entry_to_emit: usize,
-    next_tx_to_emit: usize,
-}
-
-impl SegmentStream {
-    /// Compact the streaming buffer if we’ve consumed a large prefix already.
-    fn maybe_compact(&mut self) {
-        // If we’ve consumed >1MB, drop the consumed prefix to avoid unbounded growth.
-            if self.cursor > (1 << 20) {
-                self.buf.drain(0..self.cursor);
-                self.cursor = 0;
-            }
-    }
-
-    /// Reset segment-local counters at a segment boundary.
-    fn reset_segment(&mut self) {
-        self.vec_len = None;
-        self.entries_emitted = 0;
-        // Note: we do *not* reset the buffer. The next segment begins *at* `cursor`, which may be
-        // mid-shred if boundaries don’t align to shreds. New bytes will be appended as they arrive.
-    }
-}
-
-impl SlotStream {
-    fn new() -> Self {
-        Self {
-            segments: ahash::HashMap::default(),
-        }
-    }
+    /// Keep track of total decoded transactions in the current segment so we can skip over them 
+    /// if we have already decoded them.
+    total_decoded_txns: usize,
 }
 
 /// Public handle kept in the reconstructor thread. One instance per process.
@@ -141,9 +108,7 @@ impl StreamingDecoder {
             txs_emitted: 0,
             next_index_to_buffer: segment_start,
             shred_idxs: Vec::new(),
-            shreds: Vec::new(),
-            next_entry_to_emit: 0,
-            next_tx_to_emit: 0,
+            total_decoded_txns: 0,
         });
 
         // On cases where this is not the first time we are using the segment, we should update its end to 
@@ -162,9 +127,6 @@ impl StreamingDecoder {
                             debug!("slot {slot} idx {idx}: failed to get_data: {e:?}");
                         }
                     }
-                    
-                    // store the shred for debugging purposes
-                    segment.shreds.push(s.clone());
                     
                     // Increment the index
                     idx += 1;
@@ -222,6 +184,9 @@ impl StreamingDecoder {
         //////////////////////////////////////////////
         // PARSING THE VECTOR LENGTH OF THE ENTRIES //
         //////////////////////////////////////////////
+
+        // Total transactions decoded so far in the current segment
+        let mut decoded_txns_in_segment = 0;
         
         // The vector of versioned transactions to return
         let mut txns: Vec<VersionedTransaction> = Vec::new();
@@ -318,32 +283,17 @@ impl StreamingDecoder {
                     Ok(tx) => {
                         // Only log txns that do not interact with vote program
                         if touches_program(&tx, &PUMP_FUN_PROGRAM_ID) {
-                            // Get the tx signature
-                            let sig = tx.signatures.get(0).cloned();
-                            match sig {
-                                Some(s) => {
-                                    let current_time_milliseconds = std::time::SystemTime::now().duration_since(
-                                        std::time::UNIX_EPOCH
-                                    ).unwrap().as_millis();
-                                    info!(
-                                        "tx: sig={} slot={} fec_set_index={} (entries_in_vec={}, entry_idx={}, txs_in_vec={}, tx_idx={}) milliseconds={}",
-                                        s,
-                                        slot,
-                                        stream.fec_set_index,
-                                        vec_len,
-                                        stream.entries_emitted, // current entry (0-based will be added after finishing)
-                                        txs_len,
-                                        stream.txs_emitted,
-                                        current_time_milliseconds,
-                                    );
+                            // Add the transaction to the vector if we have not already decoded it.
+                            if decoded_txns_in_segment >= stream.total_decoded_txns {
+                                // Push the versioned transaction to the vector
+                                txns.push(tx);
 
-                                    // Push the versioned transaction to the vector
-                                    txns.push(tx);
-                                }
-                                None => {
-                                    debug!("slot {slot}: no signature found for tx");
-                                }
+                                // Increment the number of decoded transactions across all iterations of this segment
+                                stream.total_decoded_txns += 1;
                             }
+
+                            // Increment the number of decoded transactions in this segment iteration
+                            decoded_txns_in_segment += 1;
                         }
                     }
                     Err(e) => {

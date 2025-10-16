@@ -321,7 +321,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         spawn(move || {
             while !exit.load(Ordering::Relaxed) {
                 sleep(Duration::from_secs(1));
-                // forward_stats.report();
+                forward_stats.report();
             }
         })
     };
